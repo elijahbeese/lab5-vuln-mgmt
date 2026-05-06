@@ -1,0 +1,38 @@
+# Real scan data — never commit
+db/lab5.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+scans/*.xml
+scans/*.html
+
+# Real OVAL feeds — public but version-noisy, not worth tracking
+content/oval/
+content/*.xlsx
+content/lab5-bundle*
+
+# Python cruft
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Secrets — paranoia first
+*.key
+*.pem
+*.p12
+.env
+.envrc
+
+# The demo DB IS allowed (it's synthetic)
+# but exclude any DB the user might create alongside it
+db/*.real.db
+db/lab5-prod*.db
