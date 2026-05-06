@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""
+acas-import: Parse OpenSCAP OVAL results XML and load findings into SQLite.
+
+Lab 5 — ACAS-Equivalent Vulnerability Management Pipeline
+System:  RHEL 9.6 (Plow), Python 3.9
+Author:  Elijah Beese
+
+Usage:
+    acas-import --results <results.xml> --feed <oval.xml> --db <lab5.db>
+                [--notes "free-form note"]
+
+Behavior:
+    - Reads the OVAL results XML produced by `oscap oval eval --results`
+    - Computes SHA-256 of the OVAL feed file used (for chain-of-custody)
+    - Extracts system fingerprint from the results XML itself
+    - Inserts one row into `scans`
+    - For every <definition result="true">:
+        * UPSERT into `vulnerabilities` (no duplicates across scans)
+        * UPSERT each CVE into `vulnerability_cves`
+        * INSERT one row into `findings` (per-scan detection event)
+    - Idempotent: re-running with the same results file is a no-op
+      (detected via UNIQUE (scan_id, rhsa_id) constraint and feed_sha256 +
+      scan_date matching).
+
+Exit codes:
+    0  = success, findings loaded
+    1  = invalid arguments / file not found
+    2  = XML parse error
+    3  = database error
+    4  = duplicate scan (same feed + same XML already imported)
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+# OVAL XML namespaces. The namespace URI changes across OVAL versions but the
+# 5.10 schema is what Red Hat publishes for RHEL 9.
+NS = {
+    'oval':     'http://oval.mitre.org/XMLSchema/oval-common-5',
+    'oval-def': 'http://oval.mitre.org/XMLSchema/oval-definitions-5',
+    'oval-res': 'http://oval.mitre.org/XMLSchema/oval-results-5',
+    'oval-sc':  'http://oval.mitre.org/XMLSchema/oval-system-characteristics-5',
+}
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Import OVAL scan results into Lab 5 SQLite DB.")
+    p.add_argument('--results', required=True, help='Path to OVAL results XML')
+    p.add_argument('--feed',    required=True, help='Path to OVAL feed XML used for the scan')
+    p.add_argument('--db',      required=True, help='Path to SQLite DB')
+    p.add_argument('--notes',   default=None,  help='Optional free-form note for this scan')
+    return p.parse_args()
+
+
+def sha256_file(path):
+    """Stream a file through SHA-256. Doesn't load the whole thing into RAM."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def derive_severity(title):
+    """
+    Extract severity from titles like 'RHSA-2025:9978: sudo security update (Important)'.
+    Returns one of: Critical, Important, Moderate, Low, Unknown.
+    """
+    m = re.search(r'\((Critical|Important|Moderate|Low)\)\s*$', title)
+    return m.group(1) if m else 'Unknown'
+
+
+def derive_package_name(title):
+    """
+    Extract the package name from a title like
+    'RHSA-2025:9978: sudo security update (Important)'.
+    Returns 'sudo' from the example, or None if we can't find it.
+    """
+    # After 'RHSA-...:' we expect ': <pkg> security update' or similar.
+    m = re.search(r':\s+([\w.+-]+)\s+(?:security|bug fix)', title)
+    return m.group(1) if m else None
+
+
+def derive_class(definition_id):
+    """definition_id like 'oval:com.redhat.rhsa:def:20259978' → 'rhsa'."""
+    m = re.search(r'oval:com\.redhat\.(rhsa|rhba|rhea):', definition_id)
+    return m.group(1) if m else 'rhsa'
+
+
+def extract_system_fingerprint(root):
+    """
+    Pull the system_info block from the results XML and return a JSON string.
+    This mirrors what the system was at scan time, captured by oscap itself.
+    """
+    fp = {}
+    sys_info = root.find('.//oval-sc:system_info', NS)
+    if sys_info is not None:
+        for tag in ('os_name', 'os_version', 'architecture', 'primary_host_name'):
+            el = sys_info.find(f'oval-sc:{tag}', NS)
+            if el is not None and el.text:
+                fp[tag] = el.text.strip()
+    return json.dumps(fp, sort_keys=True)
+
+
+def extract_definitions_metadata(root):
+    """
+    Walk <oval_definitions>/<definitions>/<definition> and build a dict:
+        definition_id → {title, severity, cves, class}
+    """
+    defs = {}
+    for d in root.findall('.//oval-def:definitions/oval-def:definition', NS):
+        def_id = d.get('id')
+        if not def_id:
+            continue
+        meta = d.find('oval-def:metadata', NS)
+        if meta is None:
+            continue
+        title_el = meta.find('oval-def:title', NS)
+        title = title_el.text.strip() if (title_el is not None and title_el.text) else ''
+
+        # CVEs come from <reference source="CVE" ref_id="CVE-..."/>
+        cves = []
+        for ref in meta.findall('oval-def:reference', NS):
+            if ref.get('source') == 'CVE':
+                cve = ref.get('ref_id')
+                if cve:
+                    cves.append(cve)
+
+        # RHSA reference
+        rhsa = None
+        for ref in meta.findall('oval-def:reference', NS):
+            if ref.get('source') in ('RHSA', 'RHBA', 'RHEA'):
+                rhsa = ref.get('ref_id')
+                break
+
+        # Severity preferred from <advisory><severity>; fall back to title.
+        sev_el = meta.find('.//oval-def:advisory/oval-def:severity', NS)
+        severity = sev_el.text.strip() if (sev_el is not None and sev_el.text) else derive_severity(title)
+        if severity not in ('Critical', 'Important', 'Moderate', 'Low'):
+            severity = derive_severity(title)
+            if severity not in ('Critical', 'Important', 'Moderate', 'Low'):
+                severity = 'Unknown'
+
+        defs[def_id] = {
+            'rhsa_id':    rhsa,
+            'title':      title,
+            'severity':   severity,
+            'cves':       cves,
+            'class':      derive_class(def_id),
+            'package':    derive_package_name(title),
+        }
+    return defs
+
+
+def extract_true_results(root):
+    """Return list of definition_ids where the result was 'true'."""
+    true_ids = []
+    for d in root.findall('.//oval-res:system/oval-res:definitions/oval-res:definition', NS):
+        if d.get('result') == 'true':
+            def_id = d.get('definition_id')
+            if def_id:
+                true_ids.append(def_id)
+    return true_ids
+
+
+def count_definitions(root):
+    """Count total definitions evaluated (true + false)."""
+    total = 0
+    true_count = 0
+    for d in root.findall('.//oval-res:system/oval-res:definitions/oval-res:definition', NS):
+        total += 1
+        if d.get('result') == 'true':
+            true_count += 1
+    return total, true_count
+
+
+def main():
+    args = parse_args()
+
+    # 1. Validate inputs.
+    for path in (args.results, args.feed, args.db):
+        if not os.path.exists(path):
+            print(f"ERROR: file not found: {path}", file=sys.stderr)
+            return 1
+
+    print(f"[*] Hashing OVAL feed: {args.feed}")
+    feed_sha = sha256_file(args.feed)
+    print(f"    sha256: {feed_sha}")
+
+    # 2. Parse results XML.
+    print(f"[*] Parsing results: {args.results}")
+    try:
+        tree = ET.parse(args.results)
+    except ET.ParseError as e:
+        print(f"ERROR: XML parse error: {e}", file=sys.stderr)
+        return 2
+    root = tree.getroot()
+
+    # 3. Extract metadata + results.
+    print(f"[*] Extracting definition metadata")
+    defs_meta = extract_definitions_metadata(root)
+    print(f"    {len(defs_meta)} definitions in feed metadata")
+
+    print(f"[*] Extracting result evaluations")
+    total, true_count = count_definitions(root)
+    true_ids = extract_true_results(root)
+    print(f"    {total} total, {true_count} true")
+    if len(true_ids) != true_count:
+        print(f"WARNING: result count mismatch ({len(true_ids)} ids vs {true_count} count)",
+              file=sys.stderr)
+
+    fingerprint = extract_system_fingerprint(root)
+    print(f"[*] System fingerprint: {fingerprint}")
+
+    # 4. Connect to DB and load.
+    print(f"[*] Connecting to DB: {args.db}")
+    try:
+        conn = sqlite3.connect(args.db)
+        conn.execute("PRAGMA foreign_keys = ON")
+        cur = conn.cursor()
+
+        # Idempotency check: same feed_sha256 + same total/true counts already imported?
+        cur.execute("""
+            SELECT scan_id, scan_date FROM scans
+            WHERE feed_sha256 = ? AND total_definitions = ? AND true_count = ?
+        """, (feed_sha, total, true_count))
+        dup = cur.fetchone()
+        if dup is not None:
+            print(f"[!] Duplicate scan detected: scan_id={dup[0]} (imported {dup[1]})", file=sys.stderr)
+            print(f"    Refusing to re-import. Pass a different --feed or delete the scan to re-run.",
+                  file=sys.stderr)
+            return 4
+
+        # Insert scan row
+        scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        feed_basename = os.path.basename(args.feed)
+        cur.execute("""
+            INSERT INTO scans (scan_date, feed_file, feed_sha256, system_fingerprint,
+                               total_definitions, true_count, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (scan_date, feed_basename, feed_sha, fingerprint, total, true_count, args.notes))
+        scan_id = cur.lastrowid
+        print(f"[*] Inserted scan_id={scan_id}")
+
+        # Insert vulnerabilities + cves + findings
+        inserted_vulns = 0
+        updated_vulns = 0
+        inserted_cves = 0
+        inserted_findings = 0
+        skipped_no_metadata = 0
+
+        for def_id in true_ids:
+            meta = defs_meta.get(def_id)
+            if meta is None:
+                skipped_no_metadata += 1
+                continue
+            rhsa = meta['rhsa_id'] or def_id  # fall back to def_id if no RHSA ref
+
+            # UPSERT vulnerability — INSERT OR IGNORE then UPDATE last_seen
+            cur.execute("""
+                INSERT OR IGNORE INTO vulnerabilities
+                    (rhsa_id, definition_id, title, severity, package_name, class,
+                     first_seen_scan_id, last_seen_scan_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (rhsa, def_id, meta['title'], meta['severity'], meta['package'],
+                  meta['class'], scan_id, scan_id))
+            if cur.rowcount > 0:
+                inserted_vulns += 1
+            else:
+                # Already existed — update last_seen to this scan
+                cur.execute("UPDATE vulnerabilities SET last_seen_scan_id = ? WHERE rhsa_id = ?",
+                            (scan_id, rhsa))
+                updated_vulns += 1
+
+            # CVE associations
+            for cve in meta['cves']:
+                cur.execute("INSERT OR IGNORE INTO vulnerability_cves (rhsa_id, cve_id) VALUES (?, ?)",
+                            (rhsa, cve))
+                if cur.rowcount > 0:
+                    inserted_cves += 1
+
+            # Finding row (per-scan detection)
+            cur.execute("""
+                INSERT INTO findings (scan_id, rhsa_id, oval_result, affected_packages)
+                VALUES (?, ?, 'true', NULL)
+            """, (scan_id, rhsa))
+            inserted_findings += 1
+
+        conn.commit()
+        conn.close()
+
+        print()
+        print(f"=== IMPORT COMPLETE ===")
+        print(f"  scan_id:                {scan_id}")
+        print(f"  vulnerabilities new:    {inserted_vulns}")
+        print(f"  vulnerabilities seen:   {updated_vulns}")
+        print(f"  cve mappings added:     {inserted_cves}")
+        print(f"  findings inserted:      {inserted_findings}")
+        if skipped_no_metadata:
+            print(f"  WARNING: skipped (no metadata): {skipped_no_metadata}")
+
+        return 0
+
+    except sqlite3.Error as e:
+        print(f"ERROR: database error: {e}", file=sys.stderr)
+        return 3
+
+
+if __name__ == '__main__':
+    sys.exit(main())

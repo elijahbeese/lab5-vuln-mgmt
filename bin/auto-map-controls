@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+auto-map-controls: Heuristically map RHSAs in `vulnerabilities` to NIST 800-53
+controls in `vuln_control_mappings` with confidence='auto'.
+
+Lab 5 — ACAS-Equivalent Vulnerability Management Pipeline
+System:  RHEL 9.6 (Plow), Python 3.9
+Author:  Elijah Beese
+
+Usage:
+    auto-map-controls --db <lab5.db> [--dry-run] [--rhsa <RHSA-ID>]
+
+Behavior:
+    - Walks every row in `vulnerabilities`.
+    - Applies the rules below to compute (rhsa_id, control_id) pairs.
+    - INSERT OR IGNORE into `vuln_control_mappings` with confidence='auto'.
+    - Existing mappings with confidence='manual' or 'verified' are NEVER
+      overwritten. Existing 'auto' mappings are preserved as-is.
+    - --dry-run prints what would be inserted without touching the DB.
+    - --rhsa filters to a single RHSA (useful for spot-checking).
+
+Mapping rules (all rules are ADDITIVE — every applicable rule fires):
+
+    DEFAULTS (every RHSA gets these):
+        SI-2  Flaw Remediation
+        RA-5  Vulnerability Monitoring and Scanning
+
+    SEVERITY ESCALATION:
+        Critical or Important → also CA-7 Continuous Monitoring
+
+    PACKAGE-CLUSTER RULES:
+        kernel / linux-firmware / microcode_ctl
+            → CM-6 Configuration Settings
+            → SC-5 Denial of Service Protection
+
+        openssl / gnutls / nss / krb5 / libssh / openssh
+            → SC-13 Cryptographic Protection
+            → SC-12 Cryptographic Key Establishment and Management
+
+        pam / sudo / shadow-utils / polkit
+            → AC-2  Account Management
+            → AC-3  Access Enforcement
+            → IA-2  Identification and Authentication
+
+        httpd / nginx / tomcat / webkit2gtk3 / libsoup / firefox / thunderbird
+            → SC-7  Boundary Protection
+            → SI-3  Malicious Code Protection
+
+        podman / buildah / skopeo / runc / containernetworking-plugins / crun
+            → CM-7  Least Functionality
+            → SC-39 Process Isolation
+
+        python3.9 / python3.11 / python3.12 / glibc / expat / libxml2 / sqlite
+            → SI-7  Software, Firmware, and Information Integrity
+
+        bind / unbound / dnsmasq / postfix / dovecot
+            → SC-7  Boundary Protection
+            → SC-20 Secure Name/Address Resolution
+
+Exit codes:
+    0  = success
+    1  = invalid arguments / file not found
+    3  = database error
+"""
+
+import argparse
+import os
+import sqlite3
+import sys
+
+
+# ============================================================================
+# Mapping rules — single source of truth for the auto-mapper.
+# Each rule is (matcher, controls, reason).
+# Matchers operate on a normalized vulnerability dict:
+#     {'rhsa_id', 'severity', 'package_name', 'title'}
+# ============================================================================
+
+DEFAULT_CONTROLS = [
+    ('SI-2', 'Flaw Remediation — every patchable vuln'),
+    ('RA-5', 'Vulnerability Monitoring and Scanning — found by scan'),
+]
+
+PACKAGE_CLUSTERS = [
+    {
+        'name': 'kernel',
+        'packages': {'kernel', 'linux-firmware', 'microcode_ctl'},
+        'controls': [
+            ('CM-6', 'Kernel/firmware controls baseline configuration'),
+            ('SC-5', 'Kernel issues frequently DoS-able'),
+        ],
+    },
+    {
+        'name': 'crypto',
+        'packages': {'openssl', 'gnutls', 'nss', 'krb5', 'libssh', 'openssh'},
+        'controls': [
+            ('SC-13', 'Cryptographic protection stack'),
+            ('SC-12', 'Cryptographic key establishment'),
+        ],
+    },
+    {
+        'name': 'auth',
+        'packages': {'pam', 'sudo', 'shadow-utils', 'polkit'},
+        'controls': [
+            ('AC-2', 'Account management infrastructure'),
+            ('AC-3', 'Access enforcement infrastructure'),
+            ('IA-2', 'Identification and authentication'),
+        ],
+    },
+    {
+        'name': 'network-facing',
+        'packages': {'httpd', 'nginx', 'tomcat', 'webkit2gtk3', 'libsoup',
+                     'firefox', 'thunderbird'},
+        'controls': [
+            ('SC-7', 'Boundary protection — network-facing component'),
+            ('SI-3', 'Malicious code protection — browser/web stack'),
+        ],
+    },
+    {
+        'name': 'container-runtime',
+        'packages': {'podman', 'buildah', 'skopeo', 'runc', 'crun',
+                     'containernetworking-plugins'},
+        'controls': [
+            ('CM-7',  'Least functionality — container runtime'),
+            ('SC-39', 'Process isolation — container boundary'),
+        ],
+    },
+    {
+        'name': 'foundational-libs',
+        'packages': {'python3.9', 'python3.11', 'python3.12', 'glibc',
+                     'expat', 'libxml2', 'sqlite'},
+        'controls': [
+            ('SI-7', 'Software/firmware integrity — foundational library'),
+        ],
+    },
+    {
+        'name': 'network-services',
+        'packages': {'bind', 'unbound', 'dnsmasq', 'postfix', 'dovecot'},
+        'controls': [
+            ('SC-7',  'Boundary protection — network service'),
+            ('SC-20', 'Secure name/address resolution'),
+        ],
+    },
+]
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Auto-map RHSAs to 800-53 controls")
+    p.add_argument('--db',     required=True, help='Path to lab5.db')
+    p.add_argument('--dry-run', action='store_true',
+                   help='Print what would be inserted without writing')
+    p.add_argument('--rhsa',   default=None,
+                   help='Limit to a single RHSA ID (for spot-checking)')
+    return p.parse_args()
+
+
+def compute_mappings(vuln):
+    """
+    Given a vuln dict, return list of (control_id, reason) pairs to map.
+    Same control may be returned multiple times with different reasons —
+    the caller dedupes.
+    """
+    mappings = []
+
+    # Defaults
+    for ctrl, reason in DEFAULT_CONTROLS:
+        mappings.append((ctrl, reason))
+
+    # Severity escalation
+    if vuln['severity'] in ('Critical', 'Important'):
+        mappings.append(('CA-7', f'Continuous monitoring required for {vuln["severity"]}'))
+
+    # Package clusters
+    pkg = vuln['package_name'] or ''
+    for cluster in PACKAGE_CLUSTERS:
+        if pkg in cluster['packages']:
+            for ctrl, reason in cluster['controls']:
+                mappings.append((ctrl, f"[{cluster['name']}] {reason}"))
+
+    return mappings
+
+
+def main():
+    args = parse_args()
+
+    if not os.path.exists(args.db):
+        print(f"ERROR: DB not found: {args.db}", file=sys.stderr)
+        return 1
+
+    try:
+        conn = sqlite3.connect(args.db)
+        conn.execute("PRAGMA foreign_keys = ON")
+        cur = conn.cursor()
+
+        # Sanity check: controls table populated?
+        cur.execute("SELECT COUNT(*) FROM controls_800_53")
+        ctrl_count = cur.fetchone()[0]
+        if ctrl_count == 0:
+            print("ERROR: controls_800_53 is empty. Run load-controls first.",
+                  file=sys.stderr)
+            return 3
+        print(f"[*] Controls catalog has {ctrl_count} rows")
+
+        # Verify every control we're about to map actually exists in the catalog.
+        # Catches typos in the mapping rules above.
+        all_referenced = {ctrl for ctrl, _ in DEFAULT_CONTROLS}
+        all_referenced.add('CA-7')
+        for cluster in PACKAGE_CLUSTERS:
+            for ctrl, _ in cluster['controls']:
+                all_referenced.add(ctrl)
+
+        cur.execute(f"""
+            SELECT control_id FROM controls_800_53
+            WHERE control_id IN ({','.join('?' * len(all_referenced))})
+        """, list(all_referenced))
+        found = {row[0] for row in cur.fetchall()}
+        missing = all_referenced - found
+        if missing:
+            print(f"ERROR: mapping rules reference controls not in catalog: {missing}",
+                  file=sys.stderr)
+            return 3
+        print(f"[*] All {len(all_referenced)} referenced controls validated")
+
+        # Pull vulnerabilities
+        if args.rhsa:
+            cur.execute("""
+                SELECT rhsa_id, severity, package_name, title FROM vulnerabilities
+                WHERE rhsa_id = ?
+            """, (args.rhsa,))
+        else:
+            cur.execute("""
+                SELECT rhsa_id, severity, package_name, title FROM vulnerabilities
+            """)
+        vulns = [
+            {'rhsa_id': r[0], 'severity': r[1], 'package_name': r[2], 'title': r[3]}
+            for r in cur.fetchall()
+        ]
+        print(f"[*] Processing {len(vulns)} vulnerabilities")
+
+        # Existing mappings — preserve manual/verified, skip auto duplicates
+        cur.execute("""
+            SELECT rhsa_id, control_id, confidence FROM vuln_control_mappings
+        """)
+        existing = {(r[0], r[1]): r[2] for r in cur.fetchall()}
+
+        new_inserts = 0
+        skipped_existing = 0
+        skipped_protected = 0
+        per_control_count = {}
+        per_cluster_count = {'default': 0, 'severity': 0}
+        for c in PACKAGE_CLUSTERS:
+            per_cluster_count[c['name']] = 0
+
+        rows_to_insert = []
+
+        for vuln in vulns:
+            mappings = compute_mappings(vuln)
+            # Dedupe per-vuln by control_id, keep first reason
+            seen_ctrls = {}
+            for ctrl, reason in mappings:
+                if ctrl not in seen_ctrls:
+                    seen_ctrls[ctrl] = reason
+
+            for ctrl, reason in seen_ctrls.items():
+                key = (vuln['rhsa_id'], ctrl)
+                existing_conf = existing.get(key)
+                if existing_conf in ('manual', 'verified'):
+                    skipped_protected += 1
+                    continue
+                if existing_conf == 'auto':
+                    skipped_existing += 1
+                    continue
+
+                rows_to_insert.append((vuln['rhsa_id'], ctrl, 'auto'))
+                per_control_count[ctrl] = per_control_count.get(ctrl, 0) + 1
+
+                # Bookkeeping for the summary
+                if ctrl in {c for c, _ in DEFAULT_CONTROLS}:
+                    per_cluster_count['default'] += 1
+                elif ctrl == 'CA-7':
+                    per_cluster_count['severity'] += 1
+                else:
+                    for cluster in PACKAGE_CLUSTERS:
+                        if ctrl in {c for c, _ in cluster['controls']}:
+                            per_cluster_count[cluster['name']] += 1
+                            break
+
+        if args.dry_run:
+            print()
+            print("=== DRY RUN — no DB writes ===")
+        else:
+            with conn:
+                cur.executemany("""
+                    INSERT OR IGNORE INTO vuln_control_mappings
+                        (rhsa_id, control_id, confidence)
+                    VALUES (?, ?, ?)
+                """, rows_to_insert)
+                new_inserts = cur.rowcount if cur.rowcount >= 0 else len(rows_to_insert)
+
+        print()
+        print("=== AUTO-MAP COMPLETE ===")
+        print(f"  vulnerabilities processed:      {len(vulns)}")
+        print(f"  new mappings inserted:          {len(rows_to_insert)}"
+              f"{' (dry-run)' if args.dry_run else ''}")
+        print(f"  existing auto mappings kept:    {skipped_existing}")
+        print(f"  manual/verified protected:      {skipped_protected}")
+        print()
+        print("=== Mappings by rule category ===")
+        for cat, count in sorted(per_cluster_count.items(), key=lambda x: -x[1]):
+            if count > 0:
+                print(f"  {cat:20} {count}")
+        print()
+        print("=== Top 10 controls by mapping count ===")
+        for ctrl, count in sorted(per_control_count.items(),
+                                  key=lambda x: (-x[1], x[0]))[:10]:
+            print(f"  {ctrl:8} {count}")
+
+        conn.close()
+        return 0
+
+    except sqlite3.Error as e:
+        print(f"ERROR: database error: {e}", file=sys.stderr)
+        return 3
+
+
+if __name__ == '__main__':
+    sys.exit(main())

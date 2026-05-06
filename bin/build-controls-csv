@@ -1,0 +1,328 @@
+
+#!/usr/bin/env python3
+"""
+build-controls-csv: Combine NIST's 800-53r5 catalog and 800-53B baseline
+XLSX files into a single CSV that the offline loader can ingest.
+
+This version uses ONLY the Python standard library — no openpyxl, no pip.
+XLSX is just a zip of XML, so `zipfile` + `xml.etree.ElementTree` can read
+it. Slower than openpyxl but trivially fast for files this size, and runs
+on any airgapped box with stock Python 3.
+
+Lab 5 — ACAS-Equivalent Vulnerability Management Pipeline
+System:  RHEL 9.6 (Plow), Python 3.9
+Author:  Elijah Beese
+
+Usage:
+    build-controls-csv \\
+        --catalog   sp800-53r5-control-catalog.xlsx \\
+        --baselines sp800-53b-control-baselines.xlsx \\
+        --out       controls_800_53r5.csv
+
+Output schema (CSV header):
+    control_id, family, title, baseline, all_baselines, description, withdrawn
+
+Where `baseline` is the *lowest* security baseline a control belongs to
+(Low > Moderate > High > Privacy > None — lowest-wins because NIST baselines
+are cumulative, so AC-1 in Low/Mod/High is reported as 'Low' = where the
+requirement first kicks in). `all_baselines` is the comma-separated full set.
+
+Exit codes:
+    0 = success
+    1 = invalid arguments / file not found
+    2 = XLSX parse error
+"""
+
+import argparse
+import csv
+import os
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+
+
+# OOXML SpreadsheetML namespace.
+NS = {
+    'a':  'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+    'r':  'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+    'pr': 'http://schemas.openxmlformats.org/package/2006/relationships',
+}
+
+
+# ============================================================================
+# XLSX READER — minimal SpreadsheetML parser, just enough for our needs
+# ============================================================================
+
+def col_letter_to_index(letters):
+    """A → 0, B → 1, Z → 25, AA → 26, AB → 27, ..."""
+    n = 0
+    for c in letters:
+        n = n * 26 + (ord(c.upper()) - ord('A') + 1)
+    return n - 1
+
+
+def parse_cell_ref(ref):
+    """'B5' → ('B', 5) → returns (col_index, row_number)."""
+    i = 0
+    while i < len(ref) and ref[i].isalpha():
+        i += 1
+    return col_letter_to_index(ref[:i]), int(ref[i:])
+
+
+def read_shared_strings(zf):
+    """
+    XLSX stores most string values in a shared-strings table referenced by
+    integer index from the cells. Returns a list of strings, indexed by
+    their shared-string ID. Cells themselves only contain "0", "1", "2"
+    etc. when their type attribute is 's'.
+    """
+    if 'xl/sharedStrings.xml' not in zf.namelist():
+        return []
+    with zf.open('xl/sharedStrings.xml') as f:
+        tree = ET.parse(f)
+    root = tree.getroot()
+    strings = []
+    # Each <si> can contain a single <t> or multiple <r><t>...</t></r> runs.
+    for si in root.findall('a:si', NS):
+        # If there's a direct <t>, that's the whole string
+        t = si.find('a:t', NS)
+        if t is not None:
+            strings.append(t.text or '')
+            continue
+        # Otherwise concatenate all <t> descendants (rich text runs)
+        parts = []
+        for sub_t in si.findall('.//a:t', NS):
+            if sub_t.text:
+                parts.append(sub_t.text)
+        strings.append(''.join(parts))
+    return strings
+
+
+def list_sheets(zf):
+    """
+    Map sheet display name (e.g. 'SP 800-53B') to the sheet's part path
+    inside the zip (e.g. 'xl/worksheets/sheet2.xml'). Returns a dict.
+    """
+    # workbook.xml gives us sheet name → r:id
+    with zf.open('xl/workbook.xml') as f:
+        wb_root = ET.parse(f).getroot()
+
+    name_to_rid = {}
+    for sheet in wb_root.findall('.//a:sheet', NS):
+        name = sheet.get('name')
+        rid = sheet.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+        if name and rid:
+            name_to_rid[name] = rid
+
+    # workbook.xml.rels maps r:id → target path
+    with zf.open('xl/_rels/workbook.xml.rels') as f:
+        rels_root = ET.parse(f).getroot()
+
+    rid_to_target = {}
+    for rel in rels_root.findall('pr:Relationship', NS):
+        rid_to_target[rel.get('Id')] = rel.get('Target')
+
+    # Combine
+    name_to_path = {}
+    for name, rid in name_to_rid.items():
+        target = rid_to_target.get(rid)
+        if not target:
+            continue
+        # Targets are relative to xl/, e.g. 'worksheets/sheet1.xml'
+        if not target.startswith('xl/'):
+            target = 'xl/' + target.lstrip('/')
+        name_to_path[name] = target
+    return name_to_path
+
+
+def read_sheet(zf, sheet_path, shared_strings):
+    """
+    Yield rows as tuples of cell values (strings or None for empty cells).
+    Rows are returned in document order. Empty trailing cells are NOT
+    padded — caller should handle short rows.
+    """
+    with zf.open(sheet_path) as f:
+        # Stream-parse to avoid building the whole DOM for big sheets
+        for event, elem in ET.iterparse(f, events=('end',)):
+            tag = elem.tag.split('}', 1)[-1]
+            if tag != 'row':
+                continue
+
+            # Build a dict of col_index → value for this row, then flatten
+            cells = {}
+            max_col = -1
+            for c in elem.findall('a:c', NS):
+                ref = c.get('r')
+                if not ref:
+                    continue
+                col_idx, _ = parse_cell_ref(ref)
+                max_col = max(max_col, col_idx)
+
+                cell_type = c.get('t', 'n')  # default is numeric
+                v = c.find('a:v', NS)
+                inline = c.find('a:is', NS)
+
+                if cell_type == 's':
+                    # Shared-string index
+                    if v is not None and v.text is not None:
+                        try:
+                            cells[col_idx] = shared_strings[int(v.text)]
+                        except (ValueError, IndexError):
+                            cells[col_idx] = ''
+                elif cell_type == 'inlineStr':
+                    # Inline string — value lives inside <is><t>...</t></is>
+                    if inline is not None:
+                        t = inline.find('a:t', NS)
+                        cells[col_idx] = (t.text or '') if t is not None else ''
+                elif cell_type == 'str':
+                    # Formula result as string
+                    cells[col_idx] = v.text if v is not None and v.text else ''
+                elif cell_type == 'b':
+                    cells[col_idx] = 'TRUE' if (v is not None and v.text == '1') else 'FALSE'
+                else:
+                    # Numeric or date — return raw text
+                    cells[col_idx] = v.text if v is not None and v.text else ''
+
+            # Flatten dict to a list, padding empty cells
+            row = [cells.get(i) for i in range(max_col + 1)] if max_col >= 0 else []
+            yield row
+
+            # Free memory while streaming
+            elem.clear()
+
+
+# ============================================================================
+# DOMAIN LOGIC — same as the openpyxl version
+# ============================================================================
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--catalog',   required=True, help='sp800-53r5-control-catalog.xlsx')
+    p.add_argument('--baselines', required=True, help='sp800-53b-control-baselines.xlsx')
+    p.add_argument('--out',       required=True, help='Output CSV path')
+    return p.parse_args()
+
+
+def load_catalog(path):
+    """Returns dict: control_id -> {title, description}"""
+    with zipfile.ZipFile(path) as zf:
+        ss = read_shared_strings(zf)
+        sheets = list_sheets(zf)
+        # Pick the first sheet (catalog has only one)
+        sheet_path = next(iter(sheets.values()))
+        catalog = {}
+        rows = read_sheet(zf, sheet_path, ss)
+        next(rows, None)  # skip header
+        for row in rows:
+            if not row or not row[0]:
+                continue
+            cid = (row[0] or '').strip()
+            name = (row[1] or '').strip() if len(row) > 1 else ''
+            text = (row[2] or '').strip() if len(row) > 2 else ''
+            catalog[cid] = {'title': name, 'description': text}
+        return catalog
+
+
+def load_baselines(path):
+    """
+    Returns dict: control_id -> {baseline, all_baselines, withdrawn}.
+    Lowest-wins for the primary `baseline` field, full set for `all_baselines`.
+    """
+    with zipfile.ZipFile(path) as zf:
+        ss = read_shared_strings(zf)
+        sheets = list_sheets(zf)
+        sheet_path = sheets.get('SP 800-53B')
+        if sheet_path is None:
+            raise RuntimeError(f"Sheet 'SP 800-53B' not found in {path}. "
+                               f"Sheets present: {list(sheets.keys())}")
+
+        baselines = {}
+        rows = read_sheet(zf, sheet_path, ss)
+        next(rows, None)  # skip header
+        for row in rows:
+            # cols: SORT-AS, Control Identifier, Name, Withdrawn,
+            #       Privacy, Low, Moderate, High
+            if len(row) < 8 or not row[1]:
+                continue
+            cid = (row[1] or '').strip()
+            withdrawn = bool(row[3] and str(row[3]).strip())
+            privacy   = bool(row[4] and str(row[4]).strip())
+            low       = bool(row[5] and str(row[5]).strip())
+            moderate  = bool(row[6] and str(row[6]).strip())
+            high      = bool(row[7] and str(row[7]).strip())
+
+            if low:         bl = 'Low'
+            elif moderate:  bl = 'Moderate'
+            elif high:      bl = 'High'
+            elif privacy:   bl = 'Privacy'
+            else:           bl = 'None'
+
+            all_bl = []
+            if low:      all_bl.append('Low')
+            if moderate: all_bl.append('Moderate')
+            if high:     all_bl.append('High')
+            if privacy:  all_bl.append('Privacy')
+            all_baselines = ','.join(all_bl) if all_bl else 'None'
+
+            baselines[cid] = {
+                'baseline': bl,
+                'withdrawn': withdrawn,
+                'all_baselines': all_baselines,
+            }
+        return baselines
+
+
+def family_of(control_id):
+    """AC-2 -> AC; AC-2(1) -> AC."""
+    return control_id.split('-', 1)[0]
+
+
+def main():
+    args = parse_args()
+
+    for path in (args.catalog, args.baselines):
+        if not os.path.exists(path):
+            print(f"ERROR: file not found: {path}", file=sys.stderr)
+            return 1
+
+    try:
+        print(f"[*] Loading catalog: {args.catalog}", file=sys.stderr)
+        catalog = load_catalog(args.catalog)
+        print(f"    {len(catalog)} controls in catalog", file=sys.stderr)
+
+        print(f"[*] Loading baselines: {args.baselines}", file=sys.stderr)
+        baselines = load_baselines(args.baselines)
+        print(f"    {len(baselines)} baseline assignments", file=sys.stderr)
+    except (zipfile.BadZipFile, ET.ParseError, RuntimeError) as e:
+        print(f"ERROR: XLSX parse error: {e}", file=sys.stderr)
+        return 2
+
+    rows_written = 0
+    by_baseline = {'Low': 0, 'Moderate': 0, 'High': 0, 'Privacy': 0, 'None': 0}
+    with open(args.out, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['control_id', 'family', 'title', 'baseline',
+                    'all_baselines', 'description', 'withdrawn'])
+        for cid, cat in sorted(catalog.items()):
+            bl_info = baselines.get(cid, {
+                'baseline': 'None', 'withdrawn': False, 'all_baselines': 'None'
+            })
+            w.writerow([
+                cid,
+                family_of(cid),
+                cat['title'],
+                bl_info['baseline'],
+                bl_info['all_baselines'],
+                cat['description'],
+                '1' if bl_info['withdrawn'] else '0',
+            ])
+            rows_written += 1
+            by_baseline[bl_info['baseline']] = by_baseline.get(bl_info['baseline'], 0) + 1
+
+    print(f"[*] Wrote {rows_written} rows to {args.out}", file=sys.stderr)
+    print(f"    baseline counts: {by_baseline}", file=sys.stderr)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

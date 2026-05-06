@@ -1,0 +1,1549 @@
+#!/usr/bin/env python3
+"""
+lab5-web: Single-file stdlib HTTP server for browsing the Lab 5 vuln database.
+
+Lab 5 — ACAS-Equivalent Vulnerability Management Pipeline
+System:  RHEL 9.6 (Plow), Python 3.9, stdlib only
+Author:  Elijah Beese
+
+Usage:
+    bin/lab5-web --db /home/<user>/lab5/db/lab5.db [--port 5000] [--host 127.0.0.1]
+
+Default binds to 127.0.0.1:5000. Access from your workstation via SSH tunnel:
+    ssh -L 5000:127.0.0.1:5000 <user>@<your-vm-host>
+Then point a browser at http://localhost:5000
+
+Design notes:
+    * Zero pip dependencies. Pure Python 3 stdlib (http.server, sqlite3,
+      urllib, html, string.Template). Defensible for airgapped environments.
+    * Server-rendered HTML. No JS framework. No build step. No CDN.
+    * Minimal vanilla JS for severity filter pills and CVE collapsibles.
+    * Aesthetic: terminal-grade SOC console — dark, monospaced, dense.
+    * Read-mostly. Only the /findings/<rhsa>/triage POST handler writes,
+      and it only INSERTs append-only triage rows (it never UPDATEs).
+    * No CSRF protection in v1: single-user, localhost-bound, behind SSH
+      tunnel. Threat model doesn't require it. Document this if scope grows.
+
+Routes:
+    GET   /                              dashboard
+    GET   /findings                      findings list (?severity= &status= &package= filters)
+    GET   /findings/<rhsa_id>            finding detail + triage history
+    POST  /findings/<rhsa_id>/triage     submit a triage decision
+    GET   /controls                      controls pivot (mappings per control)
+    GET   /controls/<control_id>         control detail (RHSAs mapped to it)
+    GET   /scans                         scan history
+    GET   /static/lab5.css               stylesheet
+    GET   /static/lab5.js                vanilla JS
+"""
+
+import argparse
+import html
+import json
+import os
+import re
+import sqlite3
+import string
+import sys
+import urllib.parse
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+VALID_TRIAGE_STATUSES = {
+    'open', 'in_progress', 'mitigated', 'risk_accepted',
+    'false_positive', 'remediated',
+}
+
+SEVERITY_ORDER = {'Critical': 0, 'Important': 1, 'Moderate': 2, 'Low': 3, 'Unknown': 4}
+
+
+# ============================================================================
+# DB HELPERS
+# ============================================================================
+
+DB_PATH = None  # set by main()
+
+def db():
+    """Open a connection. SQLite is fine being opened per-request for our scale."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def latest_scan_id():
+    with db() as c:
+        row = c.execute("SELECT scan_id FROM scans ORDER BY scan_date DESC LIMIT 1").fetchone()
+        return row['scan_id'] if row else None
+
+
+def latest_scan_info():
+    with db() as c:
+        return c.execute("SELECT * FROM scans ORDER BY scan_date DESC LIMIT 1").fetchone()
+
+
+def severity_summary():
+    """Counts open findings per severity in the latest scan, ignoring resolved."""
+    sid = latest_scan_id()
+    if sid is None:
+        return []
+    with db() as c:
+        rows = c.execute("""
+            SELECT v.severity, COUNT(*) as count
+            FROM findings f
+            JOIN vulnerabilities v ON f.rhsa_id = v.rhsa_id
+            LEFT JOIN (
+                SELECT rhsa_id, status FROM triage_decisions WHERE superseded = 0
+            ) t ON v.rhsa_id = t.rhsa_id
+            WHERE f.scan_id = ?
+              AND COALESCE(t.status, 'open') NOT IN ('remediated', 'risk_accepted', 'false_positive')
+            GROUP BY v.severity
+        """, (sid,)).fetchall()
+    return sorted(rows, key=lambda r: SEVERITY_ORDER.get(r['severity'], 99))
+
+
+def triage_summary():
+    """Counts of all triage statuses across the current scan's findings."""
+    sid = latest_scan_id()
+    if sid is None:
+        return []
+    with db() as c:
+        rows = c.execute("""
+            SELECT COALESCE(t.status, 'open') as status, COUNT(*) as count
+            FROM findings f
+            JOIN vulnerabilities v ON f.rhsa_id = v.rhsa_id
+            LEFT JOIN (
+                SELECT rhsa_id, status FROM triage_decisions WHERE superseded = 0
+            ) t ON v.rhsa_id = t.rhsa_id
+            WHERE f.scan_id = ?
+            GROUP BY COALESCE(t.status, 'open')
+            ORDER BY 2 DESC
+        """, (sid,)).fetchall()
+    return rows
+
+
+def package_summary():
+    sid = latest_scan_id()
+    if sid is None:
+        return []
+    with db() as c:
+        return c.execute("""
+            SELECT v.package_name, COUNT(*) as count
+            FROM findings f
+            JOIN vulnerabilities v ON f.rhsa_id = v.rhsa_id
+            WHERE f.scan_id = ? AND v.package_name IS NOT NULL
+            GROUP BY v.package_name
+            ORDER BY count DESC, v.package_name
+            LIMIT 12
+        """, (sid,)).fetchall()
+
+
+def control_family_summary():
+    """Count of (RHSA, control) mapping pairs grouped by control family."""
+    with db() as c:
+        return c.execute("""
+            SELECT c.family, COUNT(DISTINCT m.rhsa_id || '|' || m.control_id) as mappings
+            FROM vuln_control_mappings m
+            JOIN controls_800_53 c ON m.control_id = c.control_id
+            GROUP BY c.family
+            ORDER BY mappings DESC
+        """).fetchall()
+
+
+def all_findings(severity=None, status=None, package=None, sort='severity'):
+    """Latest-scan findings, with current triage status, optionally filtered."""
+    sid = latest_scan_id()
+    if sid is None:
+        return []
+    sql = """
+        SELECT v.rhsa_id, v.title, v.severity, v.package_name,
+               COALESCE(t.status, 'open') as current_status,
+               (SELECT COUNT(*) FROM vulnerability_cves WHERE rhsa_id = v.rhsa_id) as cve_count
+        FROM findings f
+        JOIN vulnerabilities v ON f.rhsa_id = v.rhsa_id
+        LEFT JOIN (
+            SELECT rhsa_id, status FROM triage_decisions WHERE superseded = 0
+        ) t ON v.rhsa_id = t.rhsa_id
+        WHERE f.scan_id = ?
+    """
+    params = [sid]
+    if severity:
+        sql += " AND v.severity = ?"
+        params.append(severity)
+    if status:
+        sql += " AND COALESCE(t.status, 'open') = ?"
+        params.append(status)
+    if package:
+        sql += " AND v.package_name = ?"
+        params.append(package)
+
+    if sort == 'package':
+        sql += " ORDER BY v.package_name, v.severity"
+    elif sort == 'rhsa':
+        sql += " ORDER BY v.rhsa_id"
+    else:  # severity
+        sql += """ ORDER BY
+            CASE v.severity
+                WHEN 'Critical' THEN 0 WHEN 'Important' THEN 1
+                WHEN 'Moderate' THEN 2 WHEN 'Low' THEN 3 ELSE 4 END,
+            v.rhsa_id
+        """
+
+    with db() as c:
+        return c.execute(sql, params).fetchall()
+
+
+def finding_detail(rhsa_id):
+    with db() as c:
+        vuln = c.execute("""
+            SELECT v.*, s_first.scan_date as first_seen_date, s_last.scan_date as last_seen_date
+            FROM vulnerabilities v
+            LEFT JOIN scans s_first ON v.first_seen_scan_id = s_first.scan_id
+            LEFT JOIN scans s_last ON v.last_seen_scan_id = s_last.scan_id
+            WHERE v.rhsa_id = ?
+        """, (rhsa_id,)).fetchone()
+        if not vuln:
+            return None
+        cves = [r['cve_id'] for r in c.execute(
+            "SELECT cve_id FROM vulnerability_cves WHERE rhsa_id = ? ORDER BY cve_id",
+            (rhsa_id,)).fetchall()]
+        controls = c.execute("""
+            SELECT m.control_id, c.title, m.confidence
+            FROM vuln_control_mappings m
+            JOIN controls_800_53 c ON m.control_id = c.control_id
+            WHERE m.rhsa_id = ?
+            ORDER BY m.control_id
+        """, (rhsa_id,)).fetchall()
+        triage_history = c.execute("""
+            SELECT * FROM triage_decisions WHERE rhsa_id = ?
+            ORDER BY decided_at DESC
+        """, (rhsa_id,)).fetchall()
+        current = None
+        for t in triage_history:
+            if t['superseded'] == 0:
+                current = t
+                break
+    return {
+        'vuln': vuln,
+        'cves': cves,
+        'controls': controls,
+        'triage_history': triage_history,
+        'current_triage': current,
+    }
+
+
+def insert_triage(rhsa_id, status, decided_by, notes):
+    """Append-only triage. Mark all prior rows for this RHSA as superseded,
+    then insert the new one."""
+    if status not in VALID_TRIAGE_STATUSES:
+        raise ValueError(f"invalid status: {status}")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with db() as c:
+        c.execute("UPDATE triage_decisions SET superseded = 1 WHERE rhsa_id = ?", (rhsa_id,))
+        c.execute("""
+            INSERT INTO triage_decisions (rhsa_id, status, decided_at, decided_by, notes, superseded)
+            VALUES (?, ?, ?, ?, ?, 0)
+        """, (rhsa_id, status, now, decided_by or 'analyst', notes or None))
+        c.commit()
+
+
+def all_controls_with_mappings():
+    """List of controls that have at least one mapping, with counts."""
+    with db() as c:
+        return c.execute("""
+            SELECT m.control_id, c.title, c.family, c.baseline,
+                   COUNT(DISTINCT m.rhsa_id) as vuln_count
+            FROM vuln_control_mappings m
+            JOIN controls_800_53 c ON m.control_id = c.control_id
+            GROUP BY m.control_id
+            ORDER BY vuln_count DESC, m.control_id
+        """).fetchall()
+
+
+def control_detail(control_id):
+    with db() as c:
+        ctrl = c.execute("SELECT * FROM controls_800_53 WHERE control_id = ?",
+                         (control_id,)).fetchone()
+        if not ctrl:
+            return None
+        rhsas = c.execute("""
+            SELECT v.rhsa_id, v.title, v.severity, v.package_name, m.confidence
+            FROM vuln_control_mappings m
+            JOIN vulnerabilities v ON m.rhsa_id = v.rhsa_id
+            WHERE m.control_id = ?
+            ORDER BY
+                CASE v.severity WHEN 'Critical' THEN 0 WHEN 'Important' THEN 1
+                                WHEN 'Moderate' THEN 2 WHEN 'Low' THEN 3 ELSE 4 END,
+                v.rhsa_id
+        """, (control_id,)).fetchall()
+    return {'control': ctrl, 'rhsas': rhsas}
+
+
+def all_scans():
+    with db() as c:
+        return c.execute("""
+            SELECT s.*,
+                   (SELECT COUNT(*) FROM findings WHERE scan_id = s.scan_id) as finding_count
+            FROM scans s
+            ORDER BY s.scan_date DESC
+        """).fetchall()
+
+
+# ============================================================================
+# RENDERING — string.Template + small helpers, no Jinja2
+# ============================================================================
+
+def esc(s):
+    """HTML-escape, return empty string for None."""
+    return html.escape('' if s is None else str(s))
+
+
+def severity_class(sev):
+    return {
+        'Critical': 'sev-critical', 'Important': 'sev-important',
+        'Moderate': 'sev-moderate', 'Low': 'sev-low',
+    }.get(sev, 'sev-unknown')
+
+
+def status_class(st):
+    return {
+        'open': 'st-open', 'in_progress': 'st-progress',
+        'mitigated': 'st-mitigated', 'risk_accepted': 'st-accepted',
+        'false_positive': 'st-fp', 'remediated': 'st-remediated',
+    }.get(st, 'st-open')
+
+
+def status_label(st):
+    return {
+        'open': 'OPEN', 'in_progress': 'IN PROGRESS',
+        'mitigated': 'MITIGATED', 'risk_accepted': 'RISK ACCEPTED',
+        'false_positive': 'FALSE POSITIVE', 'remediated': 'REMEDIATED',
+    }.get(st, st.upper())
+
+
+# Strip 'RHSA-2025:9978: ' prefix from titles for cleaner display.
+# Defined as a function (not inline regex in f-strings) because Python 3.9
+# rejects backslashes inside f-string expressions.
+_RHSA_PREFIX_RE = re.compile(r'^RHSA-\d+:\d+:\s*')
+
+def strip_rhsa_prefix(s):
+    return _RHSA_PREFIX_RE.sub('', s) if s else ''
+
+
+# Single layout shell. All pages plug into ${content}.
+LAYOUT = string.Template("""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${title} — Lab 5 Console</title>
+<link rel="stylesheet" href="/static/lab5.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">[L5]</span>
+    <span class="brand-name">VULN MANAGEMENT CONSOLE</span>
+  </div>
+  <nav class="nav">
+    <a href="/"          class="nav-item ${nav_dash}">DASHBOARD</a>
+    <a href="/findings"  class="nav-item ${nav_find}">FINDINGS</a>
+    <a href="/controls"  class="nav-item ${nav_ctrl}">CONTROLS</a>
+    <a href="/scans"     class="nav-item ${nav_scan}">SCANS</a>
+  </nav>
+  <div class="meta">
+    <span class="meta-label">SCAN</span>
+    <span class="meta-value">${scan_meta}</span>
+  </div>
+</header>
+<main class="main">${content}</main>
+<footer class="bottom">
+  lab5 • single-user offline build • <span class="muted">${scan_host}</span>
+</footer>
+<script src="/static/lab5.js"></script>
+</body>
+</html>""")
+
+
+def render_layout(title, content, active_nav='', scan_info=None):
+    if scan_info is None:
+        scan_info = latest_scan_info()
+    if scan_info:
+        try:
+            fp = json.loads(scan_info['system_fingerprint'])
+            host = fp.get('primary_host_name', 'unknown')
+        except Exception:
+            host = 'unknown'
+        scan_meta = f"{esc(scan_info['scan_date'])} • {esc(scan_info['feed_file'])} • {scan_info['true_count']} findings"
+    else:
+        scan_meta = "no scans imported yet"
+        host = 'unknown'
+
+    return LAYOUT.substitute(
+        title=esc(title),
+        content=content,
+        scan_meta=scan_meta,
+        scan_host=esc(host),
+        nav_dash='active' if active_nav == 'dash' else '',
+        nav_find='active' if active_nav == 'find' else '',
+        nav_ctrl='active' if active_nav == 'ctrl' else '',
+        nav_scan='active' if active_nav == 'scan' else '',
+    )
+
+
+# ----------------------------------------------------------------------------
+# Page: dashboard
+# ----------------------------------------------------------------------------
+
+def page_dashboard():
+    sev = severity_summary()
+    tri = triage_summary()
+    pkg = package_summary()
+    fam = control_family_summary()
+    scan = latest_scan_info()
+
+    if scan is None:
+        body = """<section class="empty">
+          <h1>NO SCANS IMPORTED</h1>
+          <p>Run <code>bin/acas-import</code> to ingest an OpenSCAP results XML.</p>
+        </section>"""
+        return render_layout('Dashboard', body, 'dash')
+
+    # Severity tiles
+    sev_total = sum(r['count'] for r in sev)
+    sev_tiles = []
+    for s in ['Critical', 'Important', 'Moderate', 'Low']:
+        count = next((r['count'] for r in sev if r['severity'] == s), 0)
+        sev_tiles.append(f"""
+          <a class="tile {severity_class(s)}" href="/findings?severity={esc(s)}">
+            <div class="tile-count">{count}</div>
+            <div class="tile-label">{esc(s).upper()}</div>
+          </a>
+        """)
+    sev_html = '\n'.join(sev_tiles)
+
+    # Triage breakdown
+    tri_rows = []
+    for r in tri:
+        tri_rows.append(f"""
+          <tr>
+            <td><span class="status-pill {status_class(r['status'])}">{esc(status_label(r['status']))}</span></td>
+            <td class="num">{r['count']}</td>
+          </tr>
+        """)
+    tri_html = '\n'.join(tri_rows) if tri_rows else '<tr><td colspan="2" class="muted">no findings</td></tr>'
+
+    # Top packages
+    pkg_rows = []
+    for r in pkg:
+        pkg_rows.append(f"""
+          <tr>
+            <td><a href="/findings?package={esc(r['package_name'])}">{esc(r['package_name'])}</a></td>
+            <td class="num">{r['count']}</td>
+          </tr>
+        """)
+    pkg_html = '\n'.join(pkg_rows) if pkg_rows else '<tr><td colspan="2" class="muted">no data</td></tr>'
+
+    # Control family bars
+    max_fam = max((r['mappings'] for r in fam), default=1)
+    fam_rows = []
+    for r in fam:
+        pct = int((r['mappings'] / max_fam) * 100) if max_fam else 0
+        fam_rows.append(f"""
+          <tr>
+            <td class="fam-cell">{esc(r['family'])}</td>
+            <td><div class="bar"><div class="bar-fill" style="width: {pct}%"></div></div></td>
+            <td class="num">{r['mappings']}</td>
+          </tr>
+        """)
+    fam_html = '\n'.join(fam_rows) if fam_rows else '<tr><td colspan="3" class="muted">no mappings</td></tr>'
+
+    # System fingerprint
+    try:
+        fp = json.loads(scan['system_fingerprint'])
+    except Exception:
+        fp = {}
+
+    body = f"""
+    <section class="hero">
+      <div class="hero-numbers">
+        <div class="hero-stat">
+          <div class="hero-num">{sev_total}</div>
+          <div class="hero-label">OPEN FINDINGS</div>
+        </div>
+        <div class="hero-divider"></div>
+        <div class="hero-meta">
+          <div class="hero-line"><span class="key">HOST</span> <span class="val">{esc(fp.get('primary_host_name','—'))}</span></div>
+          <div class="hero-line"><span class="key">OS</span> <span class="val">{esc(fp.get('os_name','—'))} {esc(fp.get('os_version',''))}</span></div>
+          <div class="hero-line"><span class="key">ARCH</span> <span class="val">{esc(fp.get('architecture','—'))}</span></div>
+          <div class="hero-line"><span class="key">FEED</span> <span class="val">{esc(scan['feed_file'])}</span></div>
+          <div class="hero-line"><span class="key">SCAN</span> <span class="val">{esc(scan['scan_date'])}</span></div>
+          <div class="hero-line"><span class="key">SHA-256</span> <span class="val mono-tiny">{esc(scan['feed_sha256'])}</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tiles">
+      {sev_html}
+    </section>
+
+    <section class="grid-3">
+      <div class="panel">
+        <h2 class="panel-h">TRIAGE STATUS</h2>
+        <table class="tbl">
+          <thead><tr><th>STATUS</th><th class="num">COUNT</th></tr></thead>
+          <tbody>{tri_html}</tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2 class="panel-h">TOP AFFECTED PACKAGES</h2>
+        <table class="tbl">
+          <thead><tr><th>PACKAGE</th><th class="num">RHSAs</th></tr></thead>
+          <tbody>{pkg_html}</tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2 class="panel-h">CONTROL FAMILY MAPPINGS</h2>
+        <table class="tbl">
+          <thead><tr><th>FAMILY</th><th>DENSITY</th><th class="num">COUNT</th></tr></thead>
+          <tbody>{fam_html}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+    return render_layout('Dashboard', body, 'dash', scan)
+
+
+# ----------------------------------------------------------------------------
+# Page: findings list
+# ----------------------------------------------------------------------------
+
+def page_findings(query):
+    severity = query.get('severity', [None])[0]
+    status   = query.get('status',   [None])[0]
+    package  = query.get('package',  [None])[0]
+    sort     = query.get('sort',     ['severity'])[0]
+
+    findings = all_findings(severity=severity, status=status, package=package, sort=sort)
+
+    # Filter pill bar — built from current state
+    def pill(label, key, value, current):
+        active = ' active' if current == value else ''
+        if value is None:
+            href = '/findings'
+            params = {k:v for k,v in [('severity',severity),('status',status),('package',package)] if v and k != key}
+        else:
+            params = {k:v for k,v in [('severity',severity),('status',status),('package',package)] if v}
+            params[key] = value
+            href = '/findings?' + urllib.parse.urlencode(params) if params else '/findings'
+        return f'<a class="pill{active}" href="{esc(href)}">{esc(label)}</a>'
+
+    sev_pills = (
+        pill('ALL', 'severity', None, severity) +
+        pill('CRITICAL',  'severity', 'Critical',  severity) +
+        pill('IMPORTANT', 'severity', 'Important', severity) +
+        pill('MODERATE',  'severity', 'Moderate',  severity) +
+        pill('LOW',       'severity', 'Low',       severity)
+    )
+    status_pills = (
+        pill('ALL STATUS',  'status', None,             status) +
+        pill('OPEN',        'status', 'open',           status) +
+        pill('IN PROGRESS', 'status', 'in_progress',    status) +
+        pill('MITIGATED',   'status', 'mitigated',      status) +
+        pill('ACCEPTED',    'status', 'risk_accepted',  status) +
+        pill('FALSE POS.',  'status', 'false_positive', status) +
+        pill('REMEDIATED',  'status', 'remediated',     status)
+    )
+
+    rows = []
+    for r in findings:
+        rows.append(f"""
+          <tr class="row-{severity_class(r['severity'])}">
+            <td><span class="sev-tag {severity_class(r['severity'])}">{esc(r['severity']).upper()}</span></td>
+            <td class="mono"><a href="/findings/{esc(r['rhsa_id'])}">{esc(r['rhsa_id'])}</a></td>
+            <td>{esc(r['package_name'] or '—')}</td>
+            <td class="num">{r['cve_count']}</td>
+            <td><span class="status-pill {status_class(r['current_status'])}">{esc(status_label(r['current_status']))}</span></td>
+            <td class="title-cell">{esc(strip_rhsa_prefix(r['title']))}</td>
+          </tr>
+        """)
+    rows_html = '\n'.join(rows) if rows else '<tr><td colspan="6" class="muted">no findings match these filters</td></tr>'
+
+    # Active filter chip
+    chip_parts = []
+    if severity: chip_parts.append(f'severity = <strong>{esc(severity)}</strong>')
+    if status:   chip_parts.append(f'status = <strong>{esc(status_label(status))}</strong>')
+    if package:  chip_parts.append(f'package = <strong>{esc(package)}</strong>')
+    chip_html = ' • '.join(chip_parts) if chip_parts else '<span class="muted">no filters</span>'
+
+    body = f"""
+    <section class="page-h">
+      <h1 class="h-page">FINDINGS</h1>
+      <div class="page-h-meta">{len(findings)} matching • {chip_html}</div>
+    </section>
+    <section class="filters">
+      <div class="filter-group"><span class="filter-lbl">SEVERITY</span>{sev_pills}</div>
+      <div class="filter-group"><span class="filter-lbl">STATUS</span>{status_pills}</div>
+    </section>
+    <section class="panel panel-flush">
+      <table class="tbl tbl-findings">
+        <thead><tr>
+          <th>SEV</th><th>RHSA</th><th>PACKAGE</th><th class="num">CVEs</th>
+          <th>TRIAGE</th><th>TITLE</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </section>
+    """
+    return render_layout('Findings', body, 'find')
+
+
+# ----------------------------------------------------------------------------
+# Page: finding detail
+# ----------------------------------------------------------------------------
+
+def page_finding_detail(rhsa_id):
+    d = finding_detail(rhsa_id)
+    if d is None:
+        return render_layout('Not found',
+            f'<section class="empty"><h1>404</h1><p>RHSA <code>{esc(rhsa_id)}</code> not found.</p></section>',
+            'find'), 404
+
+    v = d['vuln']
+    cur = d['current_triage']
+    cur_status = cur['status'] if cur else 'open'
+
+    # CVE list
+    cve_html = ''.join(f'<li class="mono">{esc(c)}</li>' for c in d['cves']) \
+        or '<li class="muted">none</li>'
+
+    # Controls table
+    ctrl_rows = []
+    for r in d['controls']:
+        ctrl_rows.append(f"""
+          <tr>
+            <td class="mono"><a href="/controls/{esc(r['control_id'])}">{esc(r['control_id'])}</a></td>
+            <td>{esc(r['title'])}</td>
+            <td><span class="conf conf-{esc(r['confidence'])}">{esc(r['confidence'])}</span></td>
+          </tr>
+        """)
+    ctrl_html = '\n'.join(ctrl_rows) if ctrl_rows else '<tr><td colspan="3" class="muted">no mappings</td></tr>'
+
+    # Triage history
+    hist_rows = []
+    for t in d['triage_history']:
+        marker = '◆' if t['superseded'] == 0 else '·'
+        hist_rows.append(f"""
+          <tr class="{'current' if t['superseded'] == 0 else 'historical'}">
+            <td class="mono-tiny">{marker} {esc(t['decided_at'])}</td>
+            <td><span class="status-pill {status_class(t['status'])}">{esc(status_label(t['status']))}</span></td>
+            <td>{esc(t['decided_by'])}</td>
+            <td class="notes-cell">{esc(t['notes'] or '')}</td>
+          </tr>
+        """)
+    hist_html = '\n'.join(hist_rows) if hist_rows else '<tr><td colspan="4" class="muted">no triage decisions yet</td></tr>'
+
+    title_clean = strip_rhsa_prefix(v['title'])
+
+    body = f"""
+    <section class="page-h">
+      <a class="backlink" href="/findings">← findings</a>
+      <h1 class="h-page mono">{esc(v['rhsa_id'])}</h1>
+      <div class="subtitle">{esc(title_clean)}</div>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <h2 class="panel-h">VULNERABILITY</h2>
+        <dl class="kv">
+          <dt>Severity</dt>
+          <dd><span class="sev-tag {severity_class(v['severity'])}">{esc(v['severity']).upper()}</span></dd>
+          <dt>Package</dt><dd class="mono">{esc(v['package_name'] or '—')}</dd>
+          <dt>Class</dt><dd class="mono">{esc(v['class'])}</dd>
+          <dt>OVAL definition</dt><dd class="mono mono-tiny">{esc(v['definition_id'])}</dd>
+          <dt>First seen</dt><dd class="mono">{esc(v['first_seen_date'] or '—')}</dd>
+          <dt>Last seen</dt><dd class="mono">{esc(v['last_seen_date'] or '—')}</dd>
+        </dl>
+      </div>
+      <div class="panel">
+        <h2 class="panel-h">CVEs <span class="counter">{len(d['cves'])}</span></h2>
+        <ul class="cve-list">{cve_html}</ul>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-h">MAPPED 800-53 CONTROLS <span class="counter">{len(d['controls'])}</span></h2>
+      <table class="tbl">
+        <thead><tr><th>CONTROL</th><th>TITLE</th><th>CONFIDENCE</th></tr></thead>
+        <tbody>{ctrl_html}</tbody>
+      </table>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <h2 class="panel-h">TRIAGE — RECORD DECISION</h2>
+        <form class="triage-form" method="POST" action="/findings/{esc(v['rhsa_id'])}/triage">
+          <label>STATUS
+            <select name="status" required>
+              <option value="open"           {'selected' if cur_status=='open' else ''}>Open</option>
+              <option value="in_progress"    {'selected' if cur_status=='in_progress' else ''}>In progress</option>
+              <option value="mitigated"      {'selected' if cur_status=='mitigated' else ''}>Mitigated</option>
+              <option value="risk_accepted"  {'selected' if cur_status=='risk_accepted' else ''}>Risk accepted</option>
+              <option value="false_positive" {'selected' if cur_status=='false_positive' else ''}>False positive</option>
+              <option value="remediated"     {'selected' if cur_status=='remediated' else ''}>Remediated</option>
+            </select>
+          </label>
+          <label>DECIDED BY
+            <input name="decided_by" type="text" value="analyst" required>
+          </label>
+          <label>NOTES
+            <textarea name="notes" rows="3" placeholder="rationale, compensating controls, milestone date..."></textarea>
+          </label>
+          <button type="submit" class="btn">RECORD DECISION</button>
+        </form>
+      </div>
+      <div class="panel">
+        <h2 class="panel-h">TRIAGE HISTORY <span class="counter">{len(d['triage_history'])}</span></h2>
+        <table class="tbl tbl-triage">
+          <thead><tr><th>WHEN</th><th>STATUS</th><th>BY</th><th>NOTES</th></tr></thead>
+          <tbody>{hist_html}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+    return render_layout(v['rhsa_id'], body, 'find'), 200
+
+
+# ----------------------------------------------------------------------------
+# Page: controls list
+# ----------------------------------------------------------------------------
+
+def page_controls():
+    rows = all_controls_with_mappings()
+    max_count = max((r['vuln_count'] for r in rows), default=1)
+
+    tbody = []
+    for r in rows:
+        pct = int((r['vuln_count'] / max_count) * 100) if max_count else 0
+        bl = r['baseline'] or 'None'
+        tbody.append(f"""
+          <tr>
+            <td class="mono"><a href="/controls/{esc(r['control_id'])}">{esc(r['control_id'])}</a></td>
+            <td>{esc(r['family'])}</td>
+            <td>{esc(r['title'])}</td>
+            <td><span class="bl bl-{esc(bl).lower()}">{esc(bl).upper()}</span></td>
+            <td><div class="bar"><div class="bar-fill" style="width: {pct}%"></div></div></td>
+            <td class="num">{r['vuln_count']}</td>
+          </tr>
+        """)
+    body_html = '\n'.join(tbody) if tbody else '<tr><td colspan="6" class="muted">no mappings</td></tr>'
+
+    body = f"""
+    <section class="page-h">
+      <h1 class="h-page">CONTROL MAPPINGS</h1>
+      <div class="page-h-meta">{len(rows)} controls with one or more mapped RHSAs</div>
+    </section>
+    <section class="panel panel-flush">
+      <table class="tbl tbl-controls">
+        <thead><tr>
+          <th>CONTROL</th><th>FAMILY</th><th>TITLE</th>
+          <th>BASELINE</th><th>DENSITY</th><th class="num">RHSAs</th>
+        </tr></thead>
+        <tbody>{body_html}</tbody>
+      </table>
+    </section>
+    """
+    return render_layout('Controls', body, 'ctrl')
+
+
+# ----------------------------------------------------------------------------
+# Page: control detail
+# ----------------------------------------------------------------------------
+
+def page_control_detail(control_id):
+    d = control_detail(control_id)
+    if d is None:
+        return render_layout('Not found',
+            f'<section class="empty"><h1>404</h1><p>Control <code>{esc(control_id)}</code> not found.</p></section>',
+            'ctrl'), 404
+
+    c = d['control']
+    rows = []
+    for r in d['rhsas']:
+        rows.append(f"""
+          <tr>
+            <td><span class="sev-tag {severity_class(r['severity'])}">{esc(r['severity']).upper()}</span></td>
+            <td class="mono"><a href="/findings/{esc(r['rhsa_id'])}">{esc(r['rhsa_id'])}</a></td>
+            <td>{esc(r['package_name'] or '—')}</td>
+            <td><span class="conf conf-{esc(r['confidence'])}">{esc(r['confidence'])}</span></td>
+            <td class="title-cell">{esc(strip_rhsa_prefix(r['title']))}</td>
+          </tr>
+        """)
+    rows_html = '\n'.join(rows) if rows else '<tr><td colspan="5" class="muted">no RHSAs mapped to this control</td></tr>'
+
+    desc_short = (c['description'] or '')[:600]
+    if c['description'] and len(c['description']) > 600:
+        desc_short += '…'
+
+    body = f"""
+    <section class="page-h">
+      <a class="backlink" href="/controls">← controls</a>
+      <h1 class="h-page mono">{esc(c['control_id'])}</h1>
+      <div class="subtitle">{esc(c['title'])}</div>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-h">CONTROL METADATA</h2>
+      <dl class="kv">
+        <dt>Family</dt><dd>{esc(c['family'])}</dd>
+        <dt>Baseline (lowest)</dt><dd><span class="bl bl-{esc(c['baseline'] or 'none').lower()}">{esc((c['baseline'] or 'none').upper())}</span></dd>
+        <dt>All baselines</dt><dd class="mono">{esc(c['all_baselines'] or 'None')}</dd>
+        <dt>Description</dt><dd class="desc">{esc(desc_short)}</dd>
+      </dl>
+    </section>
+
+    <section class="panel panel-flush">
+      <h2 class="panel-h">MAPPED FINDINGS <span class="counter">{len(d['rhsas'])}</span></h2>
+      <table class="tbl">
+        <thead><tr><th>SEV</th><th>RHSA</th><th>PACKAGE</th><th>CONF</th><th>TITLE</th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </section>
+    """
+    return render_layout(c['control_id'], body, 'ctrl'), 200
+
+
+# ----------------------------------------------------------------------------
+# Page: scans
+# ----------------------------------------------------------------------------
+
+def page_scans():
+    rows = all_scans()
+    tbody = []
+    for r in rows:
+        try:
+            fp = json.loads(r['system_fingerprint'])
+            host = fp.get('primary_host_name', '—')
+        except Exception:
+            host = '—'
+        tbody.append(f"""
+          <tr>
+            <td class="mono">{r['scan_id']}</td>
+            <td class="mono">{esc(r['scan_date'])}</td>
+            <td>{esc(host)}</td>
+            <td class="mono">{esc(r['feed_file'])}</td>
+            <td class="num">{r['total_definitions']}</td>
+            <td class="num">{r['true_count']}</td>
+            <td class="num">{r['finding_count']}</td>
+            <td class="mono mono-tiny">{esc((r['feed_sha256'] or '')[:16])}…</td>
+          </tr>
+        """)
+    body_html = '\n'.join(tbody) if tbody else '<tr><td colspan="8" class="muted">no scans imported</td></tr>'
+
+    body = f"""
+    <section class="page-h">
+      <h1 class="h-page">SCAN HISTORY</h1>
+      <div class="page-h-meta">{len(rows)} scan(s) on file</div>
+    </section>
+    <section class="panel panel-flush">
+      <table class="tbl">
+        <thead><tr>
+          <th>ID</th><th>DATE</th><th>HOST</th><th>FEED</th>
+          <th class="num">DEFS</th><th class="num">TRUE</th><th class="num">FINDINGS</th>
+          <th>SHA-256</th>
+        </tr></thead>
+        <tbody>{body_html}</tbody>
+      </table>
+    </section>
+    """
+    return render_layout('Scans', body, 'scan')
+
+
+# ============================================================================
+# STATIC ASSETS — embedded
+# ============================================================================
+
+LAB5_CSS = r"""
+:root {
+  --bg:        #0d1117;
+  --bg-2:      #161b22;
+  --bg-3:      #1c2128;
+  --border:    #30363d;
+  --border-2:  #3d444d;
+  --fg:        #e6edf3;
+  --fg-2:      #b1b8c0;
+  --fg-3:      #7d8590;
+  --accent:    #58a6ff;
+  --accent-2:  #1f6feb;
+
+  --critical:  #ff6b6b;
+  --critical-d:#3a1212;
+  --important: #f85149;
+  --important-d:#371414;
+  --moderate:  #d29922;
+  --moderate-d:#332514;
+  --low:       #7d8590;
+  --low-d:     #1d2125;
+  --good:      #3fb950;
+  --good-d:    #0f2316;
+
+  --mono: 'JetBrains Mono', 'Menlo', 'Consolas', 'DejaVu Sans Mono', 'Courier New', monospace;
+  --sans: 'IBM Plex Sans Condensed', 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.45;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 2px; }
+code { font-family: var(--mono); background: var(--bg-2); padding: 1px 5px; border-radius: 2px; }
+
+/* ============ TOP BAR ============ */
+.topbar {
+  display: flex; align-items: stretch;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  height: 44px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  position: sticky; top: 0; z-index: 50;
+}
+.brand {
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 18px;
+  border-right: 1px solid var(--border);
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.brand-mark {
+  color: var(--accent);
+  font-family: var(--mono);
+}
+.brand-name { color: var(--fg-2); letter-spacing: 0.12em; font-size: 11px; }
+.nav { display: flex; align-items: stretch; flex: 1; }
+.nav-item {
+  display: flex; align-items: center;
+  padding: 0 16px;
+  color: var(--fg-3);
+  text-decoration: none;
+  letter-spacing: 0.12em;
+  border-right: 1px solid var(--border);
+  transition: color .12s;
+}
+.nav-item:hover { color: var(--fg); text-decoration: none; }
+.nav-item.active {
+  color: var(--accent);
+  background: var(--bg);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.meta {
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 18px;
+  font-size: 11px;
+  color: var(--fg-3);
+  border-left: 1px solid var(--border);
+}
+.meta-label { color: var(--fg-3); letter-spacing: 0.12em; }
+.meta-value { color: var(--fg-2); font-family: var(--mono); }
+
+/* ============ MAIN ============ */
+.main {
+  padding: 22px 26px 60px;
+  flex: 1;
+  max-width: 1500px;
+  width: 100%;
+  margin: 0 auto;
+}
+.bottom {
+  border-top: 1px solid var(--border);
+  padding: 10px 26px;
+  font-size: 11px;
+  color: var(--fg-3);
+  letter-spacing: 0.04em;
+}
+.muted { color: var(--fg-3); }
+.mono { font-family: var(--mono); }
+.mono-tiny { font-size: 11px; word-break: break-all; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ============ PAGE HEADER ============ */
+.page-h { margin-bottom: 18px; }
+.page-h h1 { margin: 0; }
+.h-page {
+  font-family: var(--sans);
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg);
+  margin: 0 0 4px 0;
+}
+.subtitle {
+  color: var(--fg-2);
+  font-size: 14px;
+  margin-top: 4px;
+  max-width: 80ch;
+}
+.page-h-meta {
+  color: var(--fg-3);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+}
+.backlink {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+  display: inline-block;
+  margin-bottom: 6px;
+}
+.backlink:hover { color: var(--accent); text-decoration: none; }
+
+/* ============ HERO (dashboard) ============ */
+.hero {
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  margin-bottom: 22px;
+}
+.hero-numbers { display: grid; grid-template-columns: 280px 1px 1fr; }
+.hero-stat {
+  padding: 28px 32px;
+  display: flex; flex-direction: column; justify-content: center;
+}
+.hero-num {
+  font-family: var(--sans);
+  font-size: 64px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: var(--important);
+}
+.hero-label {
+  margin-top: 6px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+  font-size: 11px;
+}
+.hero-divider { background: var(--border); }
+.hero-meta {
+  padding: 22px 28px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 28px;
+  align-content: center;
+}
+.hero-line {
+  display: flex; gap: 14px;
+  font-size: 12px;
+  border-bottom: 1px dotted var(--border);
+  padding: 4px 0;
+}
+.hero-line .key {
+  color: var(--fg-3);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  width: 78px; flex-shrink: 0;
+}
+.hero-line .val { color: var(--fg-2); font-family: var(--mono); }
+
+/* ============ SEVERITY TILES ============ */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-bottom: 22px;
+}
+.tile {
+  display: flex; flex-direction: column; justify-content: space-between;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  text-decoration: none;
+  min-height: 110px;
+  transition: border-color .12s, transform .12s;
+  position: relative;
+}
+.tile::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--low);
+}
+.tile.sev-critical::before  { background: var(--critical); }
+.tile.sev-important::before { background: var(--important); }
+.tile.sev-moderate::before  { background: var(--moderate); }
+.tile.sev-low::before       { background: var(--low); }
+.tile:hover { border-color: var(--border-2); transform: translateY(-1px); text-decoration: none; }
+.tile-count {
+  font-family: var(--sans);
+  font-size: 38px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--fg);
+  letter-spacing: -0.01em;
+}
+.tile.sev-critical .tile-count  { color: var(--critical); }
+.tile.sev-important .tile-count { color: var(--important); }
+.tile.sev-moderate .tile-count  { color: var(--moderate); }
+.tile.sev-low .tile-count       { color: var(--low); }
+.tile-label {
+  margin-top: 4px;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+}
+
+/* ============ GRIDS ============ */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+@media (max-width: 980px) {
+  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  .tiles { grid-template-columns: 1fr 1fr; }
+  .hero-numbers { grid-template-columns: 1fr; }
+  .hero-divider { display: none; }
+}
+
+/* ============ PANELS ============ */
+.panel {
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  margin-bottom: 16px;
+}
+.panel-h {
+  margin: 0;
+  padding: 11px 16px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  font-weight: 600;
+  color: var(--fg-2);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-3);
+  text-transform: uppercase;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.counter {
+  background: var(--bg);
+  color: var(--fg-3);
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 2px;
+  border: 1px solid var(--border);
+  letter-spacing: 0.08em;
+}
+.panel-flush { padding: 0; }
+.panel-flush .panel-h ~ .tbl,
+.panel-flush > .tbl { border: none; }
+
+/* ============ TABLES ============ */
+.tbl {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.tbl th, .tbl td {
+  text-align: left;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.tbl th {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  font-weight: 600;
+  color: var(--fg-3);
+  background: var(--bg-3);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.tbl tbody tr:hover { background: rgba(88,166,255,0.04); }
+.tbl tbody tr:last-child td { border-bottom: none; }
+.title-cell { color: var(--fg-2); }
+.notes-cell { color: var(--fg-2); font-family: var(--sans); }
+
+.tbl-findings td:nth-child(1) { width: 110px; }
+.tbl-findings td:nth-child(2) { width: 160px; }
+.tbl-findings td:nth-child(3) { width: 160px; }
+.tbl-findings td:nth-child(4) { width: 60px; }
+.tbl-findings td:nth-child(5) { width: 130px; }
+
+.tbl-controls td:nth-child(1) { width: 90px; }
+.tbl-controls td:nth-child(2) { width: 70px; }
+.tbl-controls td:nth-child(4) { width: 90px; }
+.tbl-controls td:nth-child(5) { width: 220px; }
+.tbl-controls td:nth-child(6) { width: 60px; }
+
+.tbl-triage td.notes-cell { font-size: 12px; max-width: 380px; }
+.tbl-triage tr.historical { opacity: 0.55; }
+
+/* ============ SEVERITY TAGS ============ */
+.sev-tag {
+  display: inline-block;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-family: var(--mono);
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  border: 1px solid;
+  white-space: nowrap;
+}
+.sev-tag.sev-critical  { color: var(--critical); border-color: var(--critical); background: var(--critical-d); }
+.sev-tag.sev-important { color: var(--important); border-color: var(--important); background: var(--important-d); }
+.sev-tag.sev-moderate  { color: var(--moderate); border-color: var(--moderate); background: var(--moderate-d); }
+.sev-tag.sev-low       { color: var(--low); border-color: var(--low); background: var(--low-d); }
+.sev-tag.sev-unknown   { color: var(--fg-3); border-color: var(--border-2); background: var(--bg-3); }
+
+/* ============ STATUS PILLS ============ */
+.status-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--bg-3);
+  color: var(--fg-2);
+  white-space: nowrap;
+}
+.status-pill.st-open       { color: var(--important); border-color: var(--important); }
+.status-pill.st-progress   { color: var(--accent); border-color: var(--accent); }
+.status-pill.st-mitigated  { color: var(--moderate); border-color: var(--moderate); }
+.status-pill.st-accepted   { color: var(--fg-2); border-color: var(--fg-2); }
+.status-pill.st-fp         { color: var(--fg-3); border-color: var(--fg-3); }
+.status-pill.st-remediated { color: var(--good); border-color: var(--good); background: var(--good-d); }
+
+/* ============ BASELINE PILLS ============ */
+.bl {
+  display: inline-block;
+  padding: 1px 7px;
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  font-weight: 600;
+  border: 1px solid;
+}
+.bl-low      { color: #66b3ff; border-color: #66b3ff; }
+.bl-moderate { color: var(--moderate); border-color: var(--moderate); }
+.bl-high     { color: var(--important); border-color: var(--important); }
+.bl-privacy  { color: #b380e0; border-color: #b380e0; }
+.bl-none     { color: var(--fg-3); border-color: var(--fg-3); }
+
+/* ============ CONFIDENCE TAGS ============ */
+.conf {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  border: 1px solid var(--border-2);
+}
+.conf-auto     { color: var(--fg-3); }
+.conf-manual   { color: var(--accent); border-color: var(--accent); }
+.conf-verified { color: var(--good); border-color: var(--good); }
+
+/* ============ FILTER PILLS ============ */
+.filters {
+  display: flex; flex-direction: column; gap: 10px;
+  margin-bottom: 14px;
+}
+.filter-group {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+}
+.filter-lbl {
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+  margin-right: 8px;
+  min-width: 70px;
+}
+.pill {
+  display: inline-block;
+  padding: 4px 10px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  border: 1px solid var(--border);
+  color: var(--fg-2);
+  background: var(--bg-2);
+  text-decoration: none;
+}
+.pill:hover { border-color: var(--border-2); text-decoration: none; }
+.pill.active {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ============ KEY-VALUE LIST ============ */
+.kv {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 0;
+  margin: 0;
+  padding: 14px 16px;
+}
+.kv dt {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: var(--fg-3);
+  padding: 6px 0;
+  border-bottom: 1px dotted var(--border);
+  text-transform: uppercase;
+}
+.kv dd {
+  margin: 0;
+  padding: 6px 0;
+  border-bottom: 1px dotted var(--border);
+  color: var(--fg);
+}
+.kv dt:last-of-type, .kv dd:last-of-type { border-bottom: none; }
+.kv dd.desc { color: var(--fg-2); font-family: var(--sans); line-height: 1.5; }
+
+/* ============ CVE LIST ============ */
+.cve-list {
+  list-style: none;
+  margin: 0;
+  padding: 14px 16px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 16px;
+}
+.cve-list li { padding: 3px 0; border-bottom: 1px dotted var(--border); font-size: 12px; }
+.cve-list li:last-child { border-bottom: none; }
+
+/* ============ BARS ============ */
+.bar {
+  height: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  position: relative;
+  min-width: 80px;
+}
+.bar-fill {
+  height: 100%;
+  background: var(--accent);
+  background: linear-gradient(90deg, var(--accent-2), var(--accent));
+}
+.fam-cell { font-family: var(--mono); width: 60px; }
+
+/* ============ TRIAGE FORM ============ */
+.triage-form {
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 16px;
+}
+.triage-form label {
+  display: flex; flex-direction: column; gap: 6px;
+  font-size: 10.5px; letter-spacing: 0.12em;
+  color: var(--fg-3);
+}
+.triage-form select,
+.triage-form input,
+.triage-form textarea {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-2);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 0;
+}
+.triage-form textarea { font-family: var(--sans); resize: vertical; }
+.triage-form select:focus,
+.triage-form input:focus,
+.triage-form textarea:focus { outline: none; border-color: var(--accent); }
+.btn {
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  padding: 10px 14px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  font-weight: 600;
+  cursor: pointer;
+  text-transform: uppercase;
+}
+.btn:hover { background: #79b8ff; }
+
+/* ============ EMPTY STATE ============ */
+.empty {
+  text-align: center;
+  padding: 80px 20px;
+  color: var(--fg-3);
+}
+.empty h1 { font-size: 56px; color: var(--fg-2); margin: 0; font-family: var(--sans); }
+.empty p { margin-top: 12px; }
+"""
+
+LAB5_JS = r"""
+// Tiny vanilla JS — confirm before destructive triage actions.
+(function(){
+  document.querySelectorAll('form.triage-form').forEach(function(f){
+    f.addEventListener('submit', function(e){
+      var sel = f.querySelector('select[name="status"]');
+      var status = sel && sel.value;
+      var risky = (status === 'risk_accepted' || status === 'false_positive' || status === 'remediated');
+      if (risky) {
+        var ok = confirm('Record decision: ' + status.toUpperCase() + '?\n\nThis is append-only — prior decisions remain in audit trail.');
+        if (!ok) { e.preventDefault(); }
+      }
+    });
+  });
+})();
+"""
+
+
+# ============================================================================
+# ROUTING
+# ============================================================================
+
+class Lab5Handler(BaseHTTPRequestHandler):
+    server_version = "lab5/1.0"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):
+        # Cleaner log line than the default
+        sys.stderr.write("[%s] %s - %s\n" % (
+            datetime.now().strftime("%H:%M:%S"),
+            self.address_string(),
+            fmt % args,
+        ))
+
+    def _send_html(self, status, body):
+        b = body.encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(b)))
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _send_static(self, content_type, body):
+        b = body.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', content_type + '; charset=utf-8')
+        self.send_header('Content-Length', str(len(b)))
+        self.send_header('Cache-Control', 'public, max-age=300')
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _redirect(self, location, status=303):
+        self.send_response(status)
+        self.send_header('Location', location)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    def do_GET(self):
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            query = urllib.parse.parse_qs(parsed.query)
+
+            if path == '/static/lab5.css':
+                self._send_static('text/css', LAB5_CSS); return
+            if path == '/static/lab5.js':
+                self._send_static('application/javascript', LAB5_JS); return
+
+            if path == '/':
+                self._send_html(200, page_dashboard()); return
+            if path == '/findings':
+                self._send_html(200, page_findings(query)); return
+            if path == '/controls':
+                self._send_html(200, page_controls()); return
+            if path == '/scans':
+                self._send_html(200, page_scans()); return
+
+            m = re.match(r'^/findings/([^/]+)$', path)
+            if m:
+                body, status = page_finding_detail(urllib.parse.unquote(m.group(1)))
+                self._send_html(status, body); return
+
+            m = re.match(r'^/controls/([^/]+)$', path)
+            if m:
+                body, status = page_control_detail(urllib.parse.unquote(m.group(1)))
+                self._send_html(status, body); return
+
+            self._send_html(404, render_layout('Not found',
+                '<section class="empty"><h1>404</h1><p>No such page.</p></section>'))
+        except Exception as e:
+            self.log_error("GET %s: %s", self.path, e)
+            self._send_html(500, render_layout('Error',
+                f'<section class="empty"><h1>500</h1><p>{esc(str(e))}</p></section>'))
+
+    def do_POST(self):
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+
+            m = re.match(r'^/findings/([^/]+)/triage$', path)
+            if m:
+                rhsa_id = urllib.parse.unquote(m.group(1))
+                length = int(self.headers.get('Content-Length', '0'))
+                body = self.rfile.read(length).decode('utf-8') if length else ''
+                form = urllib.parse.parse_qs(body)
+                status = (form.get('status', [''])[0] or '').strip()
+                decided_by = (form.get('decided_by', [''])[0] or 'analyst').strip()
+                notes = (form.get('notes', [''])[0] or '').strip()
+                try:
+                    insert_triage(rhsa_id, status, decided_by, notes)
+                except ValueError as ve:
+                    self._send_html(400, render_layout('Bad request',
+                        f'<section class="empty"><h1>400</h1><p>{esc(str(ve))}</p></section>'))
+                    return
+                self._redirect(f'/findings/{urllib.parse.quote(rhsa_id)}')
+                return
+
+            self._send_html(405, render_layout('Not allowed',
+                '<section class="empty"><h1>405</h1><p>Method not allowed.</p></section>'))
+        except Exception as e:
+            self.log_error("POST %s: %s", self.path, e)
+            self._send_html(500, render_layout('Error',
+                f'<section class="empty"><h1>500</h1><p>{esc(str(e))}</p></section>'))
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    p = argparse.ArgumentParser(description="Lab 5 web UI")
+    p.add_argument('--db', required=True, help='Path to lab5.db')
+    p.add_argument('--host', default='127.0.0.1', help='Bind host (default 127.0.0.1)')
+    p.add_argument('--port', type=int, default=5000, help='Bind port (default 5000)')
+    args = p.parse_args()
+
+    if not os.path.exists(args.db):
+        print(f"ERROR: DB not found: {args.db}", file=sys.stderr)
+        return 1
+
+    global DB_PATH
+    DB_PATH = os.path.abspath(args.db)
+
+    server = HTTPServer((args.host, args.port), Lab5Handler)
+    print(f"[*] Lab 5 web UI on http://{args.host}:{args.port}")
+    print(f"[*] DB: {DB_PATH}")
+    print(f"[*] SSH tunnel from workstation:")
+    print(f"        ssh -L {args.port}:127.0.0.1:{args.port} <user>@<vm-host>")
+    print(f"[*] Then open http://localhost:{args.port} in your browser")
+    print(f"[*] Ctrl+C to stop")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[*] Shutting down...")
+        server.server_close()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

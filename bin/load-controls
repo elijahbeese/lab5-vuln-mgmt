@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+load-controls: Ingest the NIST 800-53 Rev 5 control catalog CSV into the
+lab5 SQLite database.
+
+Lab 5 — ACAS-Equivalent Vulnerability Management Pipeline
+System:  RHEL 9.6 (Plow), Python 3.9
+Author:  Elijah Beese
+
+Usage:
+    load-controls --csv <controls_800_53r5.csv> --db <lab5.db>
+
+Behavior:
+    - Reads CSV produced by `build-controls-csv` on the workstation.
+    - INSERT OR REPLACE into `controls_800_53` (idempotent — rerunning
+      with an updated CSV will overwrite, not duplicate).
+    - Skips withdrawn controls by default; pass --include-withdrawn to
+      load them anyway (useful if you want a complete audit-trail catalog).
+
+Notes:
+    The schema's `controls_800_53.baseline` column accepts:
+        Low, Moderate, High, Privacy, None
+    The CSV's `all_baselines` field is preserved verbatim into the DB.
+    (Schema needs the all_baselines column — we add it on first run if
+    it's missing, ALTER TABLE-style.)
+
+Exit codes:
+    0  = success
+    1  = invalid arguments / file not found
+    2  = CSV parse error
+    3  = database error
+"""
+
+import argparse
+import csv
+import os
+import sqlite3
+import sys
+
+
+VALID_BASELINES = {'Low', 'Moderate', 'High', 'Privacy', 'None'}
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Load 800-53 control catalog into lab5.db")
+    p.add_argument('--csv', required=True, help='Path to controls_800_53r5.csv')
+    p.add_argument('--db',  required=True, help='Path to lab5.db')
+    p.add_argument('--include-withdrawn', action='store_true',
+                   help='Load withdrawn controls too (default: skip)')
+    return p.parse_args()
+
+
+def ensure_all_baselines_column(conn):
+    """
+    The original schema didn't include `all_baselines`. Add it if missing.
+    SQLite's ALTER TABLE ADD COLUMN is non-destructive and idempotent
+    via try/except.
+    """
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(controls_800_53)")
+    cols = {row[1] for row in cur.fetchall()}
+    if 'all_baselines' not in cols:
+        print("[*] Adding `all_baselines` column to controls_800_53", file=sys.stderr)
+        cur.execute("ALTER TABLE controls_800_53 ADD COLUMN all_baselines TEXT")
+        conn.commit()
+
+
+def main():
+    args = parse_args()
+
+    if not os.path.exists(args.csv):
+        print(f"ERROR: CSV not found: {args.csv}", file=sys.stderr)
+        return 1
+    if not os.path.exists(args.db):
+        print(f"ERROR: DB not found: {args.db}", file=sys.stderr)
+        return 1
+
+    try:
+        conn = sqlite3.connect(args.db)
+        conn.execute("PRAGMA foreign_keys = ON")
+        ensure_all_baselines_column(conn)
+        cur = conn.cursor()
+
+        inserted = 0
+        skipped_withdrawn = 0
+        skipped_invalid = 0
+
+        with open(args.csv, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            required_cols = {'control_id', 'family', 'title', 'baseline',
+                             'all_baselines', 'description', 'withdrawn'}
+            missing = required_cols - set(reader.fieldnames or [])
+            if missing:
+                print(f"ERROR: CSV missing required columns: {missing}", file=sys.stderr)
+                return 2
+
+            # Use a single transaction for speed (1189 inserts is ~instant
+            # but still — atomic and correct).
+            with conn:
+                for row in reader:
+                    cid = (row['control_id'] or '').strip()
+                    if not cid:
+                        skipped_invalid += 1
+                        continue
+
+                    withdrawn = row['withdrawn'].strip() == '1'
+                    if withdrawn and not args.include_withdrawn:
+                        skipped_withdrawn += 1
+                        continue
+
+                    baseline = (row['baseline'] or 'None').strip()
+                    if baseline not in VALID_BASELINES:
+                        # Be defensive — schema CHECK will reject this anyway,
+                        # but produce a useful error before the constraint fires.
+                        print(f"WARN: invalid baseline {baseline!r} for {cid}, "
+                              f"setting to 'None'", file=sys.stderr)
+                        baseline = 'None'
+
+                    cur.execute("""
+                        INSERT OR REPLACE INTO controls_800_53
+                            (control_id, family, title, baseline, all_baselines,
+                             description)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        cid,
+                        (row['family'] or '').strip(),
+                        (row['title'] or '').strip(),
+                        baseline,
+                        (row['all_baselines'] or 'None').strip(),
+                        (row['description'] or '').strip(),
+                    ))
+                    inserted += 1
+
+        # Sanity counts straight from the DB
+        cur.execute("SELECT baseline, COUNT(*) FROM controls_800_53 GROUP BY baseline ORDER BY 2 DESC")
+        rows = cur.fetchall()
+
+        print()
+        print("=== LOAD COMPLETE ===")
+        print(f"  controls inserted/replaced: {inserted}")
+        if skipped_withdrawn:
+            print(f"  withdrawn skipped:          {skipped_withdrawn}")
+        if skipped_invalid:
+            print(f"  invalid skipped:            {skipped_invalid}")
+        print()
+        print("=== Baseline distribution in DB ===")
+        for bl, count in rows:
+            print(f"  {bl:10} {count}")
+
+        conn.close()
+        return 0
+
+    except sqlite3.Error as e:
+        print(f"ERROR: database error: {e}", file=sys.stderr)
+        return 3
+
+
+if __name__ == '__main__':
+    sys.exit(main())
